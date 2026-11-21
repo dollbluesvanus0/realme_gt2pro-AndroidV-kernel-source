@@ -1,0 +1,258 @@
+name: Build Realme GT 2 Pro GKI Kernel
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      lto:
+        description: 'Clang LTO mode (thin recommended for GitHub Actions RAM limits)'
+        required: true
+        default: 'thin'
+        type: choice
+        options:
+          - thin
+          - full
+          - none
+      kernel_suffix:
+        description: 'Optional suffix appended after -android12-9-g<sha> (e.g. -custom)'
+        required: false
+        default: ''
+        type: string
+      build_image_lz4:
+        description: 'Also build and upload Image.lz4'
+        required: false
+        default: false
+        type: boolean
+      create_release:
+        description: 'Publish flashable AnyKernel3 ZIP as a GitHub Release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-kernel:
+    name: Build GKI 5.10 Kernel & Package AnyKernel3
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Free disk space on runner
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/lib/android \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            curl \
+            device-tree-compiler \
+            flex \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            git \
+            kmod \
+            libelf-dev \
+            libncurses5 \
+            libssl-dev \
+            libtinfo5 \
+            lz4 \
+            python3 \
+            python-is-python3 \
+            tar \
+            unzip \
+            xz-utils \
+            zip \
+            zstd
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          path: kernel_platform/msm-kernel
+          fetch-depth: 1
+
+      - name: Fetch companion Realme/Oplus vendor source for kernel symlinks
+        run: |
+          git clone --depth=1 --single-branch \
+            https://github.com/realme-kernel-opensource/realme_gt2pro-AndroidV-vendor-source.git \
+            vendor-source-tmp
+          mv vendor-source-tmp/vendor "${GITHUB_WORKSPACE}/vendor"
+          mv vendor-source-tmp/kernel_platform/oplus "${GITHUB_WORKSPACE}/kernel_platform/oplus"
+          rm -rf vendor-source-tmp
+          test -f "${GITHUB_WORKSPACE}/kernel_platform/msm-kernel/drivers/soc/oplus/boot/Kconfig"
+          test -f "${GITHUB_WORKSPACE}/kernel_platform/msm-kernel/kernel/oplus_cpu/uad/Kconfig"
+          test -f "${GITHUB_WORKSPACE}/kernel_platform/msm-kernel/mm/oplus_mm/Kconfig"
+
+      - name: Cache AOSP Clang r416183b
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: toolchain/clang
+          key: aosp-clang-r416183b-linux-x86
+
+      - name: Download AOSP Clang r416183b
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchain/clang
+          curl -fsSL \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b.tar.gz" \
+            | tar -xz -C toolchain/clang
+
+      - name: Verify toolchain
+        run: |
+          "${GITHUB_WORKSPACE}/toolchain/clang/bin/clang" --version
+          "${GITHUB_WORKSPACE}/toolchain/clang/bin/ld.lld" --version
+
+      - name: Configure and build GKI kernel
+        id: build
+        working-directory: kernel_platform/msm-kernel
+        env:
+          LTO_MODE: ${{ inputs.lto || 'thin' }}
+          KERNEL_SUFFIX: ${{ inputs.kernel_suffix || '' }}
+          BUILD_IMAGE_LZ4: ${{ inputs.build_image_lz4 || false }}
+        run: |
+          set -euo pipefail
+          export PATH="${GITHUB_WORKSPACE}/toolchain/clang/bin:${PATH}"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER=android-build
+          export KBUILD_BUILD_HOST=github-actions
+
+          # Save GKI KMI-compliant scmversion (android12-5.10, KMI generation 9)
+          rm -f .scmversion
+          ./scripts/setlocalversion --save-scmversion . android12-5.10 9
+          if [ -n "${KERNEL_SUFFIX}" ]; then
+            printf '%s' "${KERNEL_SUFFIX}" >> .scmversion
+          fi
+          echo "SCMVERSION=$(cat .scmversion)"
+
+          MAKE_ARGS=(
+            -j"$(nproc)"
+            O=out
+            ARCH=arm64
+            LLVM=1
+            LLVM_IAS=1
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
+          )
+
+          make "${MAKE_ARGS[@]}" gki_defconfig
+
+          case "${LTO_MODE}" in
+            thin)
+              ./scripts/config --file out/.config \
+                -d LTO_CLANG_FULL \
+                -e LTO_CLANG_THIN
+              ;;
+            full)
+              ./scripts/config --file out/.config \
+                -e LTO_CLANG_FULL \
+                -d LTO_CLANG_THIN
+              ;;
+            none)
+              ./scripts/config --file out/.config \
+                -d LTO_CLANG_FULL \
+                -d LTO_CLANG_THIN \
+                -d CFI_CLANG \
+                -d CFI_PERMISSIVE
+              ;;
+          esac
+
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          TARGETS=(Image)
+          if [ "${BUILD_IMAGE_LZ4}" = "true" ]; then
+            TARGETS+=(Image.lz4)
+          fi
+
+          make "${MAKE_ARGS[@]}" "${TARGETS[@]}"
+
+          KERNEL_RELEASE="$(cat out/include/config/kernel.release)"
+          BUILD_DATE="$(date -u +%Y%m%d-%H%M)"
+          echo "kernel_release=${KERNEL_RELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "build_date=${BUILD_DATE}" >> "${GITHUB_OUTPUT}"
+
+          ls -lh out/arch/arm64/boot/Image*
+          file out/arch/arm64/boot/Image
+
+      - name: Package flashable AnyKernel3 ZIP
+        id: package
+        run: |
+          set -euo pipefail
+          KERNEL_RELEASE="${{ steps.build.outputs.kernel_release }}"
+          BUILD_DATE="${{ steps.build.outputs.build_date }}"
+          ZIP_NAME="AnyKernel3-RealmeGT2Pro-${KERNEL_RELEASE}-${BUILD_DATE}.zip"
+
+          rm -rf ak3-stage
+          cp -r kernel_platform/msm-kernel/AnyKernel3 ak3-stage
+          cp kernel_platform/msm-kernel/out/arch/arm64/boot/Image ak3-stage/Image
+
+          sed -i "s|^kernel.string=.*|kernel.string=Realme GT 2 Pro (${KERNEL_RELEASE})|" ak3-stage/anykernel.sh
+
+          (
+            cd ak3-stage
+            zip -r9 "${GITHUB_WORKSPACE}/${ZIP_NAME}" . -x '*.git*' 'README.md' '*placeholder'
+          )
+
+          echo "zip_name=${ZIP_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "zip_path=${GITHUB_WORKSPACE}/${ZIP_NAME}" >> "${GITHUB_OUTPUT}"
+
+          ls -lh "${GITHUB_WORKSPACE}/${ZIP_NAME}"
+          sha256sum "${GITHUB_WORKSPACE}/${ZIP_NAME}"
+          unzip -l "${GITHUB_WORKSPACE}/${ZIP_NAME}"
+
+      - name: Upload AnyKernel3 ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-RealmeGT2Pro-${{ steps.build.outputs.build_date }}
+          path: ${{ steps.package.outputs.zip_path }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload raw kernel Image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image-${{ steps.build.outputs.build_date }}
+          path: |
+            kernel_platform/msm-kernel/out/arch/arm64/boot/Image
+            kernel_platform/msm-kernel/out/arch/arm64/boot/Image.lz4
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.create_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}-${{ steps.build.outputs.build_date }}
+          name: Realme GT 2 Pro Kernel ${{ steps.build.outputs.kernel_release }}
+          body: |
+            - **Device:** Realme GT 2 Pro (RMX3300 / RMX3301, SM8450)
+            - **Kernel Release:** `${{ steps.build.outputs.kernel_release }}`
+            - **LTO:** `${{ inputs.lto || 'thin' }}`
+            - **Commit:** `${{ github.sha }}`
+            - **Flashable ZIP:** `${{ steps.package.outputs.zip_name }}` (flash via TWRP / OrangeFox / Kernel Flasher)
+          files: |
+            ${{ steps.package.outputs.zip_path }}
