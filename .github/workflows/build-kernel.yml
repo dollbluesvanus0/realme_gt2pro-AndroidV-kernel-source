@@ -161,6 +161,10 @@ jobs:
 
           make "${MAKE_ARGS[@]}" gki_defconfig
 
+          # Disable out-of-tree vendor sensor driver that defaults to =y in vendor Kconfig
+          # and depends on vendor-module symbols (qcom_smem, get_project).
+          ./scripts/config --file out/.config -d OPLUS_FEATURE_SENSOR_CFG
+
           case "${LTO_MODE}" in
             thin)
               ./scripts/config --file out/.config \
